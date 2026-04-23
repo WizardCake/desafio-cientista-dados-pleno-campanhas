@@ -1,0 +1,79 @@
+version: 2
+
+models:
+  - name: base_disparo_mascarado
+    description: "Tabela de performance de disparos do chatbot com dados mascarados para o desafio de Data Science."
+    columns:
+      - name: id_conta
+        description: "ID da conta (hasheado)."
+      - name: id_hsm
+        description: "ID do HSM (hasheado)."
+      - name: id_disparo
+        description: "ID único do disparo (hasheado)."
+      - name: id_sessao
+        description: "ID da sessão (hasheado)."
+      - name: cpf
+        description: "CPF do destinatário (hasheado)."
+      - name: id_target
+        description: "ID do target (hasheado)."
+      - name: contato_telefone
+        description: "Telefone que recebeu o disparo (hasheado). Chave de Join."
+      - name: categoria_hsm
+        description: "Categoria da mensagem HSM."
+      - name: ambiente
+        description: "Ambiente de envio."
+      - name: criacao_envio_datahora
+        description: "Data e hora de criação do envio (com shift temporal)."
+      - name: envio_datahora
+        description: "Timestamp de envio (com shift temporal)."
+      - name: falha_datahora
+        description: "Timestamp de falha (com shift temporal)."
+      - name: resposta_datahora
+        description: "Timestamp de resposta (com shift temporal)."
+      - name: fim_datahora
+        description: "Timestamp de fim da interação (com shift temporal)."
+      - name: descricao_falha
+        description: "Motivo técnico da falha (ex: 'User is not on WhatsApp')."
+      - name: id_status_disparo
+        description: "ID do status do disparo."
+      - name: status_disparo
+        description: "Status final (DELIVERED, READ, FAILED, SENT)."
+
+  - name: dim_telefone_mascarado
+    description: "Dimensão de telefones com dados mascarados e metadados de origem."
+    columns:
+      - name: telefone_mascarado
+        description: "ID único do telefone (hasheado). Chave de Join."
+        tests:
+          - unique
+          - not_null
+      - name: telefone_ddi
+        description: "DDI do telefone."
+      - name: telefone_ddd
+        description: "DDD do telefone (hasheado)."
+      - name: telefone_numero_mascarado
+        description: "Número do telefone sem DDD (hasheado)."
+      - name: telefone_tipo
+        description: "Tipo do telefone (Fixo, Celular, etc.)."
+      - name: telefone_nacionalidade
+        description: "Nacionalidade do telefone."
+      - name: telefone_qualidade
+        description: "Score interno de qualidade (ALTA, MEDIA, BAIXA)."
+      - name: telefone_aparicoes
+        description: "ARRAY contendo a origem do dado em diferentes sistemas."
+      - name: "telefone_aparicoes.id_sistema"
+        description: "Nome do sistema de origem (ex: SMS, SMAS, 1746)."
+      - name: "telefone_aparicoes.cpf"
+        description: "CPF do proprietário associado ao sistema (hasheado)."
+      - name: "telefone_aparicoes.proprietario_tipo"
+        description: "Tipo do proprietário (Fisica/Juridica)."
+      - name: "telefone_aparicoes.registro_data_atualizacao"
+        description: "Data em que o número foi visto pela última vez no sistema (ajustada)."
+      - name: telefone_aparicoes_quantidade
+        description: "Quantidade total de aparições do telefone."
+      - name: telefone_proprietarios_quantidade
+        description: "Quantidade de proprietários distintos associados ao telefone."
+      - name: telefone_sistemas_quantidade
+        description: "Quantidade de sistemas distintos onde o telefone aparece."
+      - name: validacao_telefone
+        description: "Status de validação do telefone."
