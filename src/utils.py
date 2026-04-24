@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from statsmodels.stats.proportion import proportion_confint
+from scipy.stats import beta as beta_dist, norm
 
 
 # ============================================================
@@ -47,20 +47,29 @@ FEATURE_COLS = [
     "max_score_origem_tempo",
     "melhor_score_sistema",
     "melhor_decaimento",
+    "score_fonte_mais_recente",
+    "decaimento_fonte_mais_recente",
+    "decaimento_medio",
     "penalidade_proprietarios",
     "score_ddd",
+    "is_ddd_21",
     "score_qualidade",
+    "score_exclusividade_cpf",
+    "log_cpfs_distintos_telefone",
     "log_n_sistemas_telefone",
     "proporcao_aparicoes_causais",
 ]
 
 PESOS_HEURISTICA = {
-    "max_score_origem_tempo": 0.45,
-    "score_qualidade": 0.10,
-    "score_ddd": 0.20,
-    "penalidade_proprietarios": 0.15,
-    "log_n_sistemas_telefone": 0.05,
-    "proporcao_aparicoes_causais": 0.05,
+    "max_score_origem_tempo": 0.35,
+    "score_fonte_mais_recente": 0.10,
+    "score_ddd": 0.15,
+    "penalidade_proprietarios": 0.10,
+    "score_exclusividade_cpf": 0.10,
+    "score_qualidade": 0.08,
+    "melhor_decaimento": 0.05,
+    "log_n_sistemas_telefone": 0.04,
+    "proporcao_aparicoes_causais": 0.03,
 }
 
 PESOS_HEURISTICA_NOTA = (
@@ -161,17 +170,18 @@ def explodir_aparicoes(df_telefone):
 
 def preparar_aparicoes_por_fonte(df_aparicoes):
     """
-    Uma linha por (telefone_numero, id_sistema).
+    Uma linha por (telefone_numero, id_sistema, registro_data_atualizacao).
 
-    Mantém a data de atualização mais recente para evitar que um telefone
-    com muitas aparições no mesmo sistema infle o ranking da fonte.
+    O join causal escolhe a ultima aparicao valida antes de cada envio.
+
+    A deduplicacao aqui evita repeticoes brutas sem perder a linha do tempo.
     """
     df = df_aparicoes.dropna(subset=["telefone_numero", "id_sistema"]).copy()
+    df["registro_data_atualizacao"] = pd.to_datetime(df["registro_data_atualizacao"], errors="coerce")
     df = (
-        df.sort_values("registro_data_atualizacao")
-        .groupby(["telefone_numero", "id_sistema"], as_index=False)
+        df.sort_values(["telefone_numero", "id_sistema", "registro_data_atualizacao"])
+        .groupby(["telefone_numero", "id_sistema", "registro_data_atualizacao"], as_index=False, dropna=False)
         .agg(
-            registro_data_atualizacao=("registro_data_atualizacao", "max"),
             cpfs_sistema_distintos=("cpf_sistema", lambda s: pd.Series(s).dropna().nunique()),
             qtd_aparicoes_brutas=("cpf_sistema", "size"),
         )
@@ -193,7 +203,7 @@ def preparar_telefone_cpf(df_aparicoes):
     return df
 
 
-def preparar_metadados_telefone(df_telefone, df_aparicoes_fonte):
+def preparar_metadados_telefone(df_telefone, df_aparicoes_fonte, df_aparicoes_brutas=None):
     """Monta metadados estáticos de telefone usados no score operacional, incluindo qualidade."""
     meta = df_telefone[[
         "telefone_numero",
@@ -206,6 +216,8 @@ def preparar_metadados_telefone(df_telefone, df_aparicoes_fonte):
         "telefone_proprietarios_quantidade": "n_proprietarios",
         "telefone_sistemas_quantidade": "n_sistemas_telefone_dim",
     })
+    meta["telefone_ddd"] = pd.to_numeric(meta["telefone_ddd"], errors="coerce")
+    meta["is_ddd_21"] = meta["telefone_ddd"].eq(21).astype(int)
     meta["n_proprietarios"] = meta["n_proprietarios"].fillna(1).clip(lower=1)
     meta["penalidade_proprietarios"] = 1 / meta["n_proprietarios"]
 
@@ -225,12 +237,78 @@ def preparar_metadados_telefone(df_telefone, df_aparicoes_fonte):
     )
     meta = meta.merge(n_sistemas, on="telefone_numero", how="left")
     meta["n_sistemas_telefone"] = meta["n_sistemas_telefone"].fillna(0).astype(int)
+
+    if df_aparicoes_brutas is not None and "cpf_sistema" in df_aparicoes_brutas.columns:
+        cpfs_distintos = (
+            df_aparicoes_brutas.groupby("telefone_numero")["cpf_sistema"]
+            .nunique(dropna=True)
+            .reset_index(name="cpfs_distintos_telefone")
+        )
+    elif "cpfs_sistema_distintos" in df_aparicoes_fonte.columns:
+        cpfs_distintos = (
+            df_aparicoes_fonte.groupby("telefone_numero")["cpfs_sistema_distintos"]
+            .sum()
+            .reset_index(name="cpfs_distintos_telefone")
+        )
+    else:
+        cpfs_distintos = pd.DataFrame({
+            "telefone_numero": meta["telefone_numero"],
+            "cpfs_distintos_telefone": 1,
+        })
+
+    meta = meta.merge(cpfs_distintos, on="telefone_numero", how="left")
+    meta["cpfs_distintos_telefone"] = meta["cpfs_distintos_telefone"].fillna(1).clip(lower=1)
+    meta["score_exclusividade_cpf"] = 1 / meta["cpfs_distintos_telefone"]
+    meta["log_cpfs_distintos_telefone"] = np.log1p(meta["cpfs_distintos_telefone"])
     return meta
 
 
 # ============================================================
 # JOIN E MÉTRICAS
 # ============================================================
+
+def _selecionar_aparicoes_evento_fonte(df_joinado, causal_only=True):
+    """
+    Seleciona no maximo uma aparicao por (disparo, sistema).
+
+    Quando ha varias atualizacoes do mesmo telefone no mesmo sistema, mantem a
+    ultima aparicao causal antes do envio. Se causal_only=False e uma fonte
+    ainda nao tem aparicao causal naquele envio, preserva uma linha nao causal
+    com score zerado para calculo de cobertura/proporcao causal.
+    """
+    keys = ["id_disparo", "id_sistema"]
+    sort_cols = keys + ["registro_data_atualizacao"]
+
+    if causal_only:
+        base = df_joinado[df_joinado["tem_data_causal"]].copy()
+        if base.empty:
+            return base
+        return (
+            base.sort_values(sort_cols, na_position="first")
+            .drop_duplicates(keys, keep="last")
+            .reset_index(drop=True)
+        )
+
+    causal = (
+        df_joinado[df_joinado["tem_data_causal"]]
+        .sort_values(sort_cols, na_position="first")
+        .drop_duplicates(keys, keep="last")
+    )
+    causal_keys = causal[keys].drop_duplicates()
+    sem_causal = df_joinado.merge(
+        causal_keys.assign(_tem_aparicao_causal=1),
+        on=keys,
+        how="left",
+    )
+    sem_causal = sem_causal[sem_causal["_tem_aparicao_causal"].isna()].drop(
+        columns=["_tem_aparicao_causal"]
+    )
+    nao_causal = (
+        sem_causal.sort_values(sort_cols, na_position="first")
+        .drop_duplicates(keys, keep="last")
+    )
+    return pd.concat([causal, nao_causal], ignore_index=True)
+
 
 def join_disparo_sistema(df_disparo, df_aparicoes_fonte, causal=False):
     """
@@ -247,10 +325,8 @@ def join_disparo_sistema(df_disparo, df_aparicoes_fonte, causal=False):
         how="inner",
     )
 
-    if causal:
-        envio = pd.to_datetime(df["envio_datahora"])
-        atualizacao = pd.to_datetime(df["registro_data_atualizacao"])
-        df = df[atualizacao.notna() & (atualizacao <= envio)].copy()
+    df = adicionar_features_temporais(df, half_life=90, reference_col="envio_datahora")
+    df = _selecionar_aparicoes_evento_fonte(df, causal_only=causal)
 
     n_disparos_depois = df["id_disparo"].nunique()
     n_linhas = len(df)
@@ -262,39 +338,59 @@ def join_disparo_sistema(df_disparo, df_aparicoes_fonte, causal=False):
     return df
 
 
-def _contar_status_unico(grupo, status):
-    return grupo.loc[grupo["status_disparo"].eq(status), "id_disparo"].nunique()
+def calcular_metricas_sistema(df_disparo_sistema, metodo_atribuicao="full"):
+    """
+    Calcula metricas por sistema.
 
-
-def calcular_metricas_sistema(df_disparo_sistema):
-    """Calcula métricas por sistema com denominador em disparos únicos."""
-    rows = []
-    for id_sistema, grupo in df_disparo_sistema.groupby("id_sistema", dropna=False):
-        total = grupo["id_disparo"].nunique()
-        read = _contar_status_unico(grupo, "read")
-        delivered = _contar_status_unico(grupo, "delivered")
-        failed = _contar_status_unico(grupo, "failed")
-        sent = _contar_status_unico(grupo, "sent")
-        rows.append({
-            "id_sistema": id_sistema,
-            "total_disparos": total,
-            "read": read,
-            "delivered": delivered,
-            "failed": failed,
-            "sent": sent,
-        })
-
-    metricas = pd.DataFrame(rows)
-    if metricas.empty:
+    metodo_atribuicao:
+    - full: cada sistema causal associado ao telefone recebe credito integral.
+    - fracionario: o credito do disparo e dividido entre sistemas causais.
+    - fonte_mais_recente: apenas a fonte causal mais recente recebe credito.
+    """
+    if df_disparo_sistema.empty:
         return pd.DataFrame(columns=[
             "id_sistema", "total_disparos", "read", "delivered", "failed", "sent",
             "sucessos_entrega", "taxa_entrega", "taxa_leitura", "taxa_falha",
+            "metodo_atribuicao",
         ])
+
+    df = df_disparo_sistema.copy()
+    metodo_atribuicao = metodo_atribuicao.lower()
+
+    if metodo_atribuicao == "fonte_mais_recente":
+        df = (
+            df.sort_values(["id_disparo", "registro_data_atualizacao", "id_sistema"], na_position="first")
+            .drop_duplicates("id_disparo", keep="last")
+            .copy()
+        )
+        df["_peso_atribuicao"] = 1.0
+    elif metodo_atribuicao == "fracionario":
+        n_fontes = df.groupby("id_disparo")["id_sistema"].transform("nunique").clip(lower=1)
+        df["_peso_atribuicao"] = 1 / n_fontes
+    elif metodo_atribuicao == "full":
+        df = df.drop_duplicates(["id_disparo", "id_sistema"]).copy()
+        df["_peso_atribuicao"] = 1.0
+    else:
+        raise ValueError("metodo_atribuicao deve ser 'full', 'fracionario' ou 'fonte_mais_recente'.")
+
+    df["_read"] = df["status_disparo"].eq("read").astype(float) * df["_peso_atribuicao"]
+    df["_delivered"] = df["status_disparo"].eq("delivered").astype(float) * df["_peso_atribuicao"]
+    df["_failed"] = df["status_disparo"].eq("failed").astype(float) * df["_peso_atribuicao"]
+    df["_sent"] = df["status_disparo"].eq("sent").astype(float) * df["_peso_atribuicao"]
+
+    metricas = df.groupby("id_sistema", dropna=False).agg(
+        total_disparos=("_peso_atribuicao", "sum"),
+        read=("_read", "sum"),
+        delivered=("_delivered", "sum"),
+        failed=("_failed", "sum"),
+        sent=("_sent", "sum"),
+    ).reset_index()
 
     metricas["sucessos_entrega"] = metricas["read"] + metricas["delivered"]
     metricas["taxa_entrega"] = metricas["sucessos_entrega"] / metricas["total_disparos"]
     metricas["taxa_leitura"] = metricas["read"] / metricas["total_disparos"]
     metricas["taxa_falha"] = metricas["failed"] / metricas["total_disparos"]
+    metricas["metodo_atribuicao"] = metodo_atribuicao
     return metricas.sort_values("taxa_entrega", ascending=False).reset_index(drop=True)
 
 
@@ -302,8 +398,54 @@ def wilson_lower_bound(successes, total, alpha=0.05):
     """Limite inferior do intervalo de confiança de Wilson."""
     if total == 0:
         return 0.0
-    ci_low, _ = proportion_confint(successes, total, alpha=alpha, method="wilson")
-    return ci_low
+    z = norm.ppf(1 - alpha / 2)
+    phat = successes / total
+    denom = 1 + z**2 / total
+    center = phat + z**2 / (2 * total)
+    margin = z * np.sqrt((phat * (1 - phat) + z**2 / (4 * total)) / total)
+    return max((center - margin) / denom, 0.0)
+
+
+def empirical_bayes_lower_bound(successes, total, global_successes, global_total, prior_strength=200, alpha=0.05):
+    """
+    Limite inferior beta-binomial com shrinkage para a media global.
+
+    E mais adequado que Wilson quando ha poucos grupos, volumes desiguais e
+    atribuicao fracionaria, porque o prior explicita o recuo para a taxa media
+    observada em vez de tratar cada fonte como um binomio isolado.
+    """
+    if global_total <= 0:
+        return 0.0
+    global_rate = np.clip(global_successes / global_total, 1e-6, 1 - 1e-6)
+    prior_alpha = global_rate * prior_strength
+    prior_beta = (1 - global_rate) * prior_strength
+    posterior_alpha = prior_alpha + successes
+    posterior_beta = prior_beta + max(total - successes, 0)
+    return float(beta_dist.ppf(alpha / 2, posterior_alpha, posterior_beta))
+
+
+def aplicar_empirical_bayes(metricas, col_sucessos="sucessos_entrega", col_total="total_disparos",
+                            nome_coluna="eb_lower_entrega", prior_strength=200, alpha=0.05):
+    """Aplica ranking beta-binomial empirico por fonte."""
+    df = metricas.copy()
+    global_successes = df[col_sucessos].sum()
+    global_total = df[col_total].sum()
+    global_rate = global_successes / global_total if global_total > 0 else 0
+    df["posterior_mean_entrega"] = (
+        df[col_sucessos] + global_rate * prior_strength
+    ) / (df[col_total] + prior_strength)
+    df[nome_coluna] = df.apply(
+        lambda row: empirical_bayes_lower_bound(
+            row[col_sucessos],
+            row[col_total],
+            global_successes,
+            global_total,
+            prior_strength=prior_strength,
+            alpha=alpha,
+        ),
+        axis=1,
+    )
+    return df.sort_values(nome_coluna, ascending=False).reset_index(drop=True)
 
 
 def aplicar_wilson(metricas, col_sucessos="sucessos_entrega", col_total="total_disparos", nome_coluna="wilson_lower_entrega"):
@@ -324,10 +466,26 @@ def normalizar_0_1(series):
     return (series - series.min()) / (series.max() - series.min())
 
 
-def calcular_score_sistema(metricas):
+def calcular_score_sistema(metricas, metodo_ranking="empirical_bayes", prior_strength=200):
     """Score conservador de fonte, alinhado a entrega."""
+    if metricas.empty:
+        return metricas.copy()
+
     df = aplicar_wilson(metricas)
-    df["score_sistema"] = normalizar_0_1(df["wilson_lower_entrega"])
+    df = aplicar_empirical_bayes(df, prior_strength=prior_strength)
+
+    if metodo_ranking == "wilson":
+        score_col = "wilson_lower_entrega"
+    elif metodo_ranking in {"empirical_bayes", "eb_lower"}:
+        score_col = "eb_lower_entrega"
+    elif metodo_ranking == "posterior_mean":
+        score_col = "posterior_mean_entrega"
+    else:
+        raise ValueError("metodo_ranking deve ser 'empirical_bayes', 'wilson' ou 'posterior_mean'.")
+
+    df["score_sistema_raw"] = df[score_col]
+    df["score_sistema"] = normalizar_0_1(df["score_sistema_raw"])
+    df["metodo_ranking"] = metodo_ranking
     return df.sort_values("score_sistema", ascending=False).reset_index(drop=True)
 
 
@@ -410,10 +568,50 @@ def preparar_metricas_cpf(df_disparo):
 # PRIORIZAÇÃO — FUNÇÕES DO NOTEBOOK 02
 # ============================================================
 
-def aprender_ranking_sistemas(df_disparo_periodo, df_aparicoes_fonte_base):
+def criar_splits_temporais(df, time_col="envio_datahora", frac_treino=0.60, frac_tuning=0.20):
+    """
+    Cria splits temporais treino/tuning/teste por volume de eventos.
+
+    O tuning escolhe hiperparametros como half-life. O teste fica isolado
+    para avaliacao final offline.
+    """
+    if frac_treino <= 0 or frac_tuning <= 0 or frac_treino + frac_tuning >= 1:
+        raise ValueError("Use frac_treino > 0, frac_tuning > 0 e soma menor que 1.")
+
+    df_sorted = df.sort_values(time_col).reset_index(drop=True)
+    n = len(df_sorted)
+    if n < 3:
+        raise ValueError("Sao necessarios ao menos 3 eventos para split temporal.")
+
+    idx_tuning = max(1, min(n - 2, int(n * frac_treino)))
+    idx_teste = max(idx_tuning + 1, min(n - 1, int(n * (frac_treino + frac_tuning))))
+    cutoff_tuning = df_sorted.loc[idx_tuning, time_col]
+    cutoff_teste = df_sorted.loc[idx_teste, time_col]
+
+    treino = df[df[time_col] < cutoff_tuning].copy()
+    tuning = df[(df[time_col] >= cutoff_tuning) & (df[time_col] < cutoff_teste)].copy()
+    teste = df[df[time_col] >= cutoff_teste].copy()
+
+    return {
+        "treino": treino,
+        "tuning": tuning,
+        "teste": teste,
+        "cutoff_tuning": cutoff_tuning,
+        "cutoff_teste": cutoff_teste,
+        "frac_treino": frac_treino,
+        "frac_tuning": frac_tuning,
+        "frac_teste": 1 - frac_treino - frac_tuning,
+    }
+
+
+def aprender_ranking_sistemas(df_disparo_periodo, df_aparicoes_fonte_base,
+                              metodo_atribuicao="full", metodo_ranking="empirical_bayes"):
     """Aprende ranking causal de sistemas a partir de um período de disparos."""
     df_join = join_disparo_sistema(df_disparo_periodo, df_aparicoes_fonte_base, causal=True)
-    metricas = calcular_score_sistema(calcular_metricas_sistema(df_join))
+    metricas = calcular_score_sistema(
+        calcular_metricas_sistema(df_join, metodo_atribuicao=metodo_atribuicao),
+        metodo_ranking=metodo_ranking,
+    )
     return metricas, df_join
 
 
@@ -442,11 +640,14 @@ def montar_eventos(df_disparo_base, df_aparicoes_scored, df_meta, half_life):
         )
         .merge(
             df_meta[["telefone_numero", "telefone_ddd", "n_proprietarios", "penalidade_proprietarios",
-                      "n_sistemas_telefone", "score_qualidade"]],
+                      "n_sistemas_telefone", "score_qualidade", "is_ddd_21",
+                      "cpfs_distintos_telefone", "score_exclusividade_cpf",
+                      "log_cpfs_distintos_telefone"]],
             on="telefone_numero", how="left",
         )
     )
     df = adicionar_features_temporais(df, half_life, reference_col="envio_datahora")
+    df = _selecionar_aparicoes_evento_fonte(df, causal_only=False)
     df["id_sistema_causal"] = df["id_sistema"].where(df["tem_data_causal"])
     df["score_sistema_causal"] = df["score_sistema"].where(df["tem_data_causal"], 0.0)
     df["decaimento_causal"] = df["decaimento_temporal"].where(df["tem_data_causal"], 0.0)
@@ -455,22 +656,70 @@ def montar_eventos(df_disparo_base, df_aparicoes_scored, df_meta, half_life):
     eventos = df.groupby([
         "id_disparo", "cpf", "contato_telefone", "envio_datahora", "status_disparo",
         "telefone_ddd", "n_proprietarios", "penalidade_proprietarios",
-        "n_sistemas_telefone", "score_qualidade",
+        "n_sistemas_telefone", "score_qualidade", "is_ddd_21",
+        "cpfs_distintos_telefone", "score_exclusividade_cpf", "log_cpfs_distintos_telefone",
     ], as_index=False, dropna=False).agg(
         max_score_origem_tempo=("score_aparicao_causal", "max"),
         melhor_score_sistema=("score_sistema_causal", "max"),
         melhor_decaimento=("decaimento_causal", "max"),
         melhor_dias_atualizacao=("dias_desde_atualizacao", "min"),
+        media_dias_atualizacao=("dias_desde_atualizacao", "mean"),
+        decaimento_medio=("decaimento_causal", "mean"),
         proporcao_aparicoes_causais=("tem_data_causal", "mean"),
         qtd_sistemas_candidatos=("id_sistema_causal", "nunique"),
     )
 
+    causais = df[df["tem_data_causal"]].copy()
+    if not causais.empty:
+        fonte_recente = (
+            causais.sort_values(["id_disparo", "registro_data_atualizacao", "score_sistema_causal"], na_position="first")
+            .drop_duplicates("id_disparo", keep="last")
+            [["id_disparo", "id_sistema", "score_sistema_causal", "dias_desde_atualizacao", "decaimento_causal"]]
+            .rename(columns={
+                "id_sistema": "id_sistema_fonte_mais_recente",
+                "score_sistema_causal": "score_fonte_mais_recente",
+                "dias_desde_atualizacao": "dias_fonte_mais_recente",
+                "decaimento_causal": "decaimento_fonte_mais_recente",
+            })
+        )
+        melhor_fonte = (
+            causais.sort_values(["id_disparo", "score_aparicao_causal", "registro_data_atualizacao"], na_position="first")
+            .drop_duplicates("id_disparo", keep="last")
+            [["id_disparo", "dias_desde_atualizacao", "decaimento_causal"]]
+            .rename(columns={
+                "dias_desde_atualizacao": "dias_melhor_fonte",
+                "decaimento_causal": "decaimento_melhor_fonte",
+            })
+        )
+        eventos = eventos.merge(fonte_recente, on="id_disparo", how="left")
+        eventos = eventos.merge(melhor_fonte, on="id_disparo", how="left")
+    else:
+        eventos["id_sistema_fonte_mais_recente"] = np.nan
+        eventos["score_fonte_mais_recente"] = 0.0
+        eventos["dias_fonte_mais_recente"] = 9999
+        eventos["decaimento_fonte_mais_recente"] = 0.0
+        eventos["dias_melhor_fonte"] = 9999
+        eventos["decaimento_melhor_fonte"] = 0.0
+
     eventos["telefone_ddd"] = eventos["telefone_ddd"].fillna(-1)
+    eventos["is_ddd_21"] = eventos["is_ddd_21"].fillna(0).astype(int)
     eventos["n_proprietarios"] = eventos["n_proprietarios"].fillna(1).clip(lower=1)
     eventos["penalidade_proprietarios"] = eventos["penalidade_proprietarios"].fillna(1.0)
     eventos["n_sistemas_telefone"] = eventos["qtd_sistemas_candidatos"].fillna(0).astype(int)
     eventos["log_n_sistemas_telefone"] = np.log1p(eventos["n_sistemas_telefone"])
     eventos["score_qualidade"] = eventos["score_qualidade"].fillna(QUALIDADE_DEFAULT)
+    eventos["cpfs_distintos_telefone"] = eventos["cpfs_distintos_telefone"].fillna(1).clip(lower=1)
+    eventos["score_exclusividade_cpf"] = eventos["score_exclusividade_cpf"].fillna(1.0)
+    eventos["log_cpfs_distintos_telefone"] = eventos["log_cpfs_distintos_telefone"].fillna(
+        np.log1p(eventos["cpfs_distintos_telefone"])
+    )
+    eventos["score_fonte_mais_recente"] = eventos["score_fonte_mais_recente"].fillna(0.0)
+    eventos["dias_fonte_mais_recente"] = eventos["dias_fonte_mais_recente"].fillna(9999)
+    eventos["decaimento_fonte_mais_recente"] = eventos["decaimento_fonte_mais_recente"].fillna(0.0)
+    eventos["dias_melhor_fonte"] = eventos["dias_melhor_fonte"].fillna(9999)
+    eventos["decaimento_melhor_fonte"] = eventos["decaimento_melhor_fonte"].fillna(0.0)
+    eventos["media_dias_atualizacao"] = eventos["media_dias_atualizacao"].fillna(9999)
+    eventos["decaimento_medio"] = eventos["decaimento_medio"].fillna(0.0)
     eventos["y_entrega"] = eventos["status_disparo"].isin(STATUS_ENTREGA).astype(int)
     eventos["y_read"] = (eventos["status_disparo"] == "read").astype(int)
     return eventos
@@ -508,6 +757,20 @@ def score_phones_at_reference(df_aparicoes_scored, df_meta, reference_time, half
     df = df_aparicoes_scored.copy()
     df["reference_time"] = reference_time
     df = adicionar_features_temporais(df, half_life, reference_col="reference_time")
+    keys = ["telefone_numero", "id_sistema"]
+    causal = (
+        df[df["tem_data_causal"]]
+        .sort_values(keys + ["registro_data_atualizacao"], na_position="first")
+        .drop_duplicates(keys, keep="last")
+    )
+    causal_keys = causal[keys].drop_duplicates()
+    sem_causal = df.merge(causal_keys.assign(_tem_aparicao_causal=1), on=keys, how="left")
+    sem_causal = sem_causal[sem_causal["_tem_aparicao_causal"].isna()].drop(columns=["_tem_aparicao_causal"])
+    nao_causal = (
+        sem_causal.sort_values(keys + ["registro_data_atualizacao"], na_position="first")
+        .drop_duplicates(keys, keep="last")
+    )
+    df = pd.concat([causal, nao_causal], ignore_index=True)
     df["id_sistema_causal"] = df["id_sistema"].where(df["tem_data_causal"])
     df["score_sistema_causal"] = df["score_sistema"].where(df["tem_data_causal"], 0.0)
     df["decaimento_causal"] = df["decaimento_temporal"].where(df["tem_data_causal"], 0.0)
@@ -518,20 +781,68 @@ def score_phones_at_reference(df_aparicoes_scored, df_meta, reference_time, half
         melhor_score_sistema=("score_sistema_causal", "max"),
         melhor_decaimento=("decaimento_causal", "max"),
         melhor_dias_atualizacao=("dias_desde_atualizacao", "min"),
+        media_dias_atualizacao=("dias_desde_atualizacao", "mean"),
+        decaimento_medio=("decaimento_causal", "mean"),
         proporcao_aparicoes_causais=("tem_data_causal", "mean"),
         qtd_sistemas_candidatos=("id_sistema_causal", "nunique"),
     )
+    causais = df[df["tem_data_causal"]].copy()
+    if not causais.empty:
+        fonte_recente = (
+            causais.sort_values(["telefone_numero", "registro_data_atualizacao", "score_sistema_causal"], na_position="first")
+            .drop_duplicates("telefone_numero", keep="last")
+            [["telefone_numero", "id_sistema", "score_sistema_causal", "dias_desde_atualizacao", "decaimento_causal"]]
+            .rename(columns={
+                "id_sistema": "id_sistema_fonte_mais_recente",
+                "score_sistema_causal": "score_fonte_mais_recente",
+                "dias_desde_atualizacao": "dias_fonte_mais_recente",
+                "decaimento_causal": "decaimento_fonte_mais_recente",
+            })
+        )
+        melhor_fonte = (
+            causais.sort_values(["telefone_numero", "score_aparicao_causal", "registro_data_atualizacao"], na_position="first")
+            .drop_duplicates("telefone_numero", keep="last")
+            [["telefone_numero", "dias_desde_atualizacao", "decaimento_causal"]]
+            .rename(columns={
+                "dias_desde_atualizacao": "dias_melhor_fonte",
+                "decaimento_causal": "decaimento_melhor_fonte",
+            })
+        )
+        telefones = telefones.merge(fonte_recente, on="telefone_numero", how="left")
+        telefones = telefones.merge(melhor_fonte, on="telefone_numero", how="left")
+    else:
+        telefones["id_sistema_fonte_mais_recente"] = np.nan
+        telefones["score_fonte_mais_recente"] = 0.0
+        telefones["dias_fonte_mais_recente"] = 9999
+        telefones["decaimento_fonte_mais_recente"] = 0.0
+        telefones["dias_melhor_fonte"] = 9999
+        telefones["decaimento_melhor_fonte"] = 0.0
     telefones = telefones.merge(
         df_meta[["telefone_numero", "telefone_ddd", "n_proprietarios",
-                   "penalidade_proprietarios", "n_sistemas_telefone", "score_qualidade"]],
+                   "penalidade_proprietarios", "n_sistemas_telefone", "score_qualidade",
+                   "is_ddd_21", "cpfs_distintos_telefone", "score_exclusividade_cpf",
+                   "log_cpfs_distintos_telefone"]],
         on="telefone_numero", how="left",
     )
     telefones["telefone_ddd"] = telefones["telefone_ddd"].fillna(-1)
+    telefones["is_ddd_21"] = telefones["is_ddd_21"].fillna(0).astype(int)
     telefones["n_proprietarios"] = telefones["n_proprietarios"].fillna(1).clip(lower=1)
     telefones["penalidade_proprietarios"] = telefones["penalidade_proprietarios"].fillna(1.0)
     telefones["n_sistemas_telefone"] = telefones["qtd_sistemas_candidatos"].fillna(0).astype(int)
     telefones["log_n_sistemas_telefone"] = np.log1p(telefones["n_sistemas_telefone"])
     telefones["score_qualidade"] = telefones["score_qualidade"].fillna(QUALIDADE_DEFAULT)
+    telefones["cpfs_distintos_telefone"] = telefones["cpfs_distintos_telefone"].fillna(1).clip(lower=1)
+    telefones["score_exclusividade_cpf"] = telefones["score_exclusividade_cpf"].fillna(1.0)
+    telefones["log_cpfs_distintos_telefone"] = telefones["log_cpfs_distintos_telefone"].fillna(
+        np.log1p(telefones["cpfs_distintos_telefone"])
+    )
+    telefones["score_fonte_mais_recente"] = telefones["score_fonte_mais_recente"].fillna(0.0)
+    telefones["dias_fonte_mais_recente"] = telefones["dias_fonte_mais_recente"].fillna(9999)
+    telefones["decaimento_fonte_mais_recente"] = telefones["decaimento_fonte_mais_recente"].fillna(0.0)
+    telefones["dias_melhor_fonte"] = telefones["dias_melhor_fonte"].fillna(9999)
+    telefones["decaimento_melhor_fonte"] = telefones["decaimento_melhor_fonte"].fillna(0.0)
+    telefones["media_dias_atualizacao"] = telefones["media_dias_atualizacao"].fillna(9999)
+    telefones["decaimento_medio"] = telefones["decaimento_medio"].fillna(0.0)
     telefones = telefones.merge(prior_ddd.rename(columns={"score_prior": "score_ddd"}), on="telefone_ddd", how="left")
     telefones["score_ddd"] = telefones["score_ddd"].fillna(baseline_ddd)
 
@@ -571,6 +882,9 @@ def gerar_selecoes(df_candidatos, incluir_random=True):
         selecionar_top2(df_candidatos, "mais_recente",
                         ["melhor_dias_atualizacao", "score_heuristico", "telefone_numero"],
                         [True, False, True]),
+        selecionar_top2(df_candidatos, "fonte_mais_recente",
+                        ["score_fonte_mais_recente", "dias_fonte_mais_recente", "score_heuristico", "telefone_numero"],
+                        [False, True, False, True]),
         selecionar_top2(df_candidatos, "alfabetico",
                         ["telefone_numero"],
                         [True]),
@@ -679,7 +993,9 @@ def calcular_metricas_por_categoria(df_disparo_sistema, df_disparo_base=None):
     Permite verificar se o desempenho de um sistema varia
     significativamente entre categorias de campanha.
     """
-    if df_disparo_base is not None and "categoria_hsm" in df_disparo_base.columns:
+    if "categoria_hsm" in df_disparo_sistema.columns:
+        df = df_disparo_sistema.copy()
+    elif df_disparo_base is not None and "categoria_hsm" in df_disparo_base.columns:
         df = df_disparo_sistema.merge(
             df_disparo_base[["id_disparo", "categoria_hsm"]].drop_duplicates(),
             on="id_disparo", how="left",
