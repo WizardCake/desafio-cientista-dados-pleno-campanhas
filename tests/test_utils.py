@@ -11,12 +11,15 @@ from src.utils import (
     STATUS_ENTREGA,
     STATUS_INVALIDOS,
     TIPOS_FIXOS,
+    empirical_bayes_lower_bound,
     wilson_lower_bound,
     normalizar_0_1,
     calcular_score_sistema,
     calcular_metricas_sistema,
     preparar_metadados_telefone,
     adicionar_features_temporais,
+    join_disparo_sistema,
+    criar_splits_temporais,
     selecionar_top2,
     prob_ao_menos_um_sucesso,
     soma_com_evidencia,
@@ -43,6 +46,9 @@ class TestConstantes:
 
     def test_feature_cols_contem_qualidade(self):
         assert "score_qualidade" in FEATURE_COLS
+        assert "score_fonte_mais_recente" in FEATURE_COLS
+        assert "score_exclusividade_cpf" in FEATURE_COLS
+        assert "is_ddd_21" in FEATURE_COLS
 
     def test_pesos_heuristica_soma_um(self):
         total = sum(PESOS_HEURISTICA.values())
@@ -72,6 +78,17 @@ class TestWilsonLowerBound:
         lb_low = wilson_lower_bound(1, 2, alpha=0.05)
         lb_high = wilson_lower_bound(50, 100, alpha=0.05)
         assert lb_low < lb_high
+
+
+class TestEmpiricalBayesLowerBound:
+    def test_total_zero_global(self):
+        assert empirical_bayes_lower_bound(0, 0, 0, 0) == 0.0
+
+    def test_shrinkage_fonte_pequena(self):
+        pequena = empirical_bayes_lower_bound(1, 1, 90, 100, prior_strength=20)
+        grande = empirical_bayes_lower_bound(90, 100, 90, 100, prior_strength=20)
+        assert pequena < 1.0
+        assert grande > pequena
 
 
 class TestNormalizar01:
@@ -105,10 +122,62 @@ class TestCalcularMetricasSistema:
         assert len(metricas) == 2
         assert "taxa_entrega" in metricas.columns
 
+    def test_fracionario_divide_credito_entre_fontes(self):
+        df = pd.DataFrame({
+            "id_sistema": ["A", "B", "A"],
+            "id_disparo": [1, 1, 2],
+            "status_disparo": ["read", "read", "failed"],
+            "registro_data_atualizacao": [
+                pd.Timestamp("2024-01-01"),
+                pd.Timestamp("2024-01-02"),
+                pd.Timestamp("2024-01-03"),
+            ],
+        })
+        metricas = calcular_metricas_sistema(df, metodo_atribuicao="fracionario")
+        total_a = metricas.loc[metricas["id_sistema"] == "A", "total_disparos"].iloc[0]
+        sucesso_a = metricas.loc[metricas["id_sistema"] == "A", "sucessos_entrega"].iloc[0]
+        assert abs(total_a - 1.5) < 1e-9
+        assert abs(sucesso_a - 0.5) < 1e-9
+
+    def test_fonte_mais_recente_atribui_um_sistema_por_disparo(self):
+        df = pd.DataFrame({
+            "id_sistema": ["A", "B"],
+            "id_disparo": [1, 1],
+            "status_disparo": ["read", "read"],
+            "registro_data_atualizacao": [
+                pd.Timestamp("2024-01-01"),
+                pd.Timestamp("2024-02-01"),
+            ],
+        })
+        metricas = calcular_metricas_sistema(df, metodo_atribuicao="fonte_mais_recente")
+        assert metricas["total_disparos"].sum() == 1.0
+        assert metricas["id_sistema"].tolist() == ["B"]
+
     def test_vazio(self):
         df = pd.DataFrame(columns=["id_sistema", "id_disparo", "status_disparo"])
         metricas = calcular_metricas_sistema(df)
         assert metricas.empty
+
+
+class TestCalcularScoreSistema:
+    def test_score_empirical_bayes_padrao(self):
+        metricas = pd.DataFrame({
+            "id_sistema": ["A", "B"],
+            "total_disparos": [100, 10],
+            "read": [80, 9],
+            "delivered": [10, 0],
+            "failed": [10, 1],
+            "sent": [0, 0],
+            "sucessos_entrega": [90, 9],
+            "taxa_entrega": [0.90, 0.90],
+            "taxa_leitura": [0.80, 0.90],
+            "taxa_falha": [0.10, 0.10],
+        })
+        result = calcular_score_sistema(metricas)
+        assert "eb_lower_entrega" in result.columns
+        assert "posterior_mean_entrega" in result.columns
+        assert "wilson_lower_entrega" in result.columns
+        assert result["metodo_ranking"].eq("empirical_bayes").all()
 
 
 class TestPrepararMetadadosTelefone:
@@ -127,9 +196,17 @@ class TestPrepararMetadadosTelefone:
             "cpfs_sistema_distintos": [1, 1, 1],
             "qtd_aparicoes_brutas": [1, 1, 1],
         })
-        meta = preparar_metadados_telefone(df_telefone, df_aparicoes)
+        df_aparicoes_brutas = pd.DataFrame({
+            "telefone_numero": [1, 1, 2, 3],
+            "cpf_sistema": ["cpf1", "cpf2", "cpf3", "cpf4"],
+        })
+        meta = preparar_metadados_telefone(df_telefone, df_aparicoes, df_aparicoes_brutas)
         assert "score_qualidade" in meta.columns
+        assert "score_exclusividade_cpf" in meta.columns
+        assert "is_ddd_21" in meta.columns
         assert meta.loc[meta["telefone_numero"] == 1, "score_qualidade"].values[0] == 1.0
+        assert meta.loc[meta["telefone_numero"] == 1, "score_exclusividade_cpf"].values[0] == 0.5
+        assert meta.loc[meta["telefone_numero"] == 1, "is_ddd_21"].values[0] == 1
         assert meta.loc[meta["telefone_numero"] == 2, "score_qualidade"].values[0] == 0.5
         assert meta.loc[meta["telefone_numero"] == 3, "score_qualidade"].values[0] == 0.0
         assert meta.loc[meta["telefone_numero"] == 4, "score_qualidade"].values[0] == QUALIDADE_DEFAULT
@@ -151,6 +228,42 @@ class TestAdicionarFeaturesTemporais:
         assert result.loc[2, "tem_data_causal"] == False
         assert result.loc[0, "decaimento_temporal"] > 0
         assert result.loc[1, "dias_desde_atualizacao"] == 9999
+
+
+class TestJoinDisparoSistema:
+    def test_causal_usa_ultima_aparicao_antes_do_envio(self):
+        df_disparo = pd.DataFrame({
+            "id_disparo": [1],
+            "contato_telefone": [10],
+            "envio_datahora": [pd.Timestamp("2024-06-01")],
+            "status_disparo": ["read"],
+        })
+        df_aparicoes = pd.DataFrame({
+            "telefone_numero": [10, 10],
+            "id_sistema": ["A", "A"],
+            "registro_data_atualizacao": [
+                pd.Timestamp("2024-01-01"),
+                pd.Timestamp("2024-07-01"),
+            ],
+        })
+        result = join_disparo_sistema(df_disparo, df_aparicoes, causal=True)
+        assert len(result) == 1
+        assert result["registro_data_atualizacao"].iloc[0] == pd.Timestamp("2024-01-01")
+
+
+class TestCriarSplitsTemporais:
+    def test_split_sem_vazamento_temporal(self):
+        df = pd.DataFrame({
+            "envio_datahora": pd.date_range("2024-01-01", periods=10, freq="D"),
+            "id_disparo": range(10),
+        })
+        splits = criar_splits_temporais(df, frac_treino=0.6, frac_tuning=0.2)
+        assert len(splits["treino"]) > 0
+        assert len(splits["tuning"]) > 0
+        assert len(splits["teste"]) > 0
+        assert splits["treino"]["envio_datahora"].max() < splits["cutoff_tuning"]
+        assert splits["tuning"]["envio_datahora"].min() >= splits["cutoff_tuning"]
+        assert splits["teste"]["envio_datahora"].min() >= splits["cutoff_teste"]
 
 
 class TestSelecionarTop2:
