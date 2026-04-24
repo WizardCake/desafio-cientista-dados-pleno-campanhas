@@ -151,4 +151,4 @@ python -m pytest tests/test_utils.py -v
 
 ## Autor
 
-Solução desenvolvida para o processo seletivo de Cientista de Dados Pleno — Squad WhatsApp, Prefeitura do Rio.
+Matheus de Andrade Santos
