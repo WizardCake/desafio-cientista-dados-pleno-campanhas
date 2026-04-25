@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
-import pytest
 
-from src.utils import (
+from utils import (
     QUALIDADE_DEFAULT,
     QUALIDADE_MAP,
     FEATURE_COLS,
