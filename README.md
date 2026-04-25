@@ -1,198 +1,156 @@
 # Desafio Técnico — Cientista de Dados Pleno (Squad WhatsApp)
 
-> **Objetivo:** Criar a **Inteligência de Escolha** — identificar quais fontes de dados são mais confiáveis e, para cada CPF com múltiplos telefones, selecionar automaticamente os **2 melhores** para receber mensagens via WhatsApp.
+## Objetivo
 
----
+Este repositório contém a solução para o desafio técnico do Squad WhatsApp: construir uma **Inteligência de Escolha** para selecionar, para cada CPF com múltiplos telefones candidatos, os **dois melhores telefones** para receber mensagens via WhatsApp.
 
-## Estrutura do Repositório
+A solução responde às três partes do enunciado:
 
+1. **Análise exploratória e qualidade de fontes:** medir o "calor" dos sistemas de origem dos telefones.
+2. **Inteligência de priorização:** transformar esses sinais em uma regra operacional de escolha top-2 por CPF.
+3. **Desenho de experimento:** propor um teste A/B para validar se a nova regra melhora a estratégia atual.
+
+## Leitura recomendada
+
+O principal documento de leitura é o [RELATORIO.md](RELATORIO.md). Ele consolida os quatro notebooks em uma narrativa única, explicando a progressão lógica da solução:
+
+```text
+inspeção dos dados
+=> definição da métrica
+=> join causal entre disparos e fontes
+=> ranking de sistemas
+=> decaimento temporal
+=> algoritmo de escolha top-2
+=> validação offline
+=> desenho de teste A/B
 ```
+
+O relatório é a melhor porta de entrada para o leitor entender o nexo entre as etapas e por que cada decisão metodológica foi tomada. Já os notebooks são a implementação analítica detalhada, onde cada passo e seus resultados estão registrados.
+
+## Estrutura do repositório
+
+```text
 desafio-cientista-dados-pleno-campanhas/
-├── README.md                               # Este arquivo
-├── RELATORIO.md                            # Relatório completo de resultados
-├── requirements.txt                        # Dependências Python
-├── tests/
-│   └── test_utils.py                       # Testes unitários
-├── src/
-│   └── utils.py                            # Funções utilitárias compartilhadas
-├── notebooks/
-│   ├── 00_inspecao_inicial.ipynb           # Validação de schema e premissas
-│   ├── 01_eda_e_qualidade_fontes.ipynb     # Parte 1: Análise exploratória e qualidade
-│   ├── 02_inteligencia_priorizacao.ipynb   # Parte 2: Ranking e algoritmo de escolha
-│   └── 03_desenho_experimento.ipynb        # Parte 3: Desenho de teste A/B
+├── README.md
+├── RELATORIO.md
+├── requirements.txt
 ├── enunciado/
-│   └── README.md                           # Enunciado original do desafio
+│   └── README.md
+├── notebooks/
+│   ├── 00_inspecao_inicial.ipynb
+│   ├── 01_eda_e_qualidade_fontes.ipynb
+│   ├── 02_inteligencia_priorizacao.ipynb
+│   └── 03_desenho_experimento.ipynb
+├── src/
+│   └── utils.py
+├── tests/
+│   └── test_utils.py
 └── data/
-    ├── raw/                                # Dados brutos (baixados do GCS, .gitignore)
-    └── processed/                          # Artefatos gerados (.gitignore)
+    ├── raw/
+    └── processed/
 ```
 
----
+## Notebooks
 
-## Como Reproduzir
+Os notebooks devem ser lidos e executados na ordem abaixo.
 
-### 1. Instalar Dependências
+| Notebook | Papel na solução |
+|---|---|
+| `00_inspecao_inicial.ipynb` | Valida schema, chaves de join, status, cobertura e premissas iniciais. |
+| `01_eda_e_qualidade_fontes.ipynb` | Mede a qualidade das fontes com join causal, ranking Empirical Bayes e análise de decaimento temporal. |
+| `02_inteligencia_priorizacao.ipynb` | Constrói a regra de escolha top-2 por CPF, compara modelo, heurística e baselines, e define o champion. |
+| `03_desenho_experimento.ipynb` | Desenha o teste A/B, define hipóteses, métricas, guardrails, tamanho amostral e duração estimada. |
+
+## Abordagem resumida
+
+A métrica operacional principal é **entrega**, definida como:
+
+```text
+status_disparo em {delivered, read}
+```
+
+O status `read` é contabilizado como entrega porque representa um estado posterior ao recebimento: se a mensagem foi lida, ela necessariamente chegou ao WhatsApp do destinatário. A leitura também é acompanhada separadamente como métrica secundária de negócio.
+
+A análise usa um **join causal** entre disparos e fontes. Uma fonte só recebe crédito por um disparo se o telefone já existia naquela fonte antes do envio:
+
+```text
+registro_data_atualizacao <= envio_datahora
+```
+
+Esse cuidado evita vazamento temporal e reduz o risco de inflar uma fonte que só registrou o telefone depois do disparo.
+
+O ranking dos sistemas usa **Empirical Bayes Lower Bound**, que combina taxa observada e incerteza amostral. Isso evita promover fontes pequenas apenas por flutuação de poucos disparos bem-sucedidos.
+
+Na etapa de priorização, foram comparados modelo logístico, heurística ponderada e baselines determinísticos. A política candidata final foi `fonte_mais_recente`, por ter melhor comportamento na validação offline de decisão e por ser simples de explicar operacionalmente. Ela é tratada como **champion candidato para A/B**, não como prova definitiva de ganho.
+
+## Premissas principais
+
+- `processing` é status intermediário e não entra no cálculo de desfecho.
+- Telefones fixos são excluídos por premissa operacional de WhatsApp.
+- Entrega operacional é `delivered` ou `read`.
+- O join entre disparos e fontes é causal.
+- O ranking de sistemas é conservador, usando Empirical Bayes.
+- A validação offline é indicativa, não causal.
+- A decisão final de substituição da regra deve ser feita por teste A/B randomizado por CPF.
+
+## Como reproduzir
+
+### 1. Criar ambiente e instalar dependências
 
 ```bash
 python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Baixar os Dados
+Em Linux/Mac:
 
-Os dados são baixados automaticamente no Notebook 00 a partir do bucket GCS público:
-`https://storage.googleapis.com/case_vagas/whatsapp/`
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-Ou manualmente seguindo as instruções no notebook.
+### 2. Obter os dados
 
-### 3. Executar os Notebooks (em ordem)
+Os dados do desafio estão no bucket indicado no enunciado:
 
-1. `00_inspecao_inicial.ipynb` — Validação de schema, chaves de join e distribuições
-2. `01_eda_e_qualidade_fontes.ipynb` — Parte 1 do enunciado (EDA e qualidade de fontes)
-3. `02_inteligencia_priorizacao.ipynb` — Parte 2 (ranking de sistemas e algoritmo de escolha)
-4. `03_desenho_experimento.ipynb` — Parte 3 (desenho de teste A/B)
+```text
+https://console.cloud.google.com/storage/browser/case_vagas/whatsapp
+```
 
-### 4. Rodar os Testes
+O notebook `00_inspecao_inicial.ipynb` contém a lógica de verificação dos arquivos locais e download quando necessário.
+
+Arquivos esperados em `data/raw/`:
+
+```text
+whatsapp_base_disparo_mascarado.parquet
+whatsapp_dim_telefone_mascarado.parquet
+whatsapp_schema.yml
+```
+
+### 3. Executar os notebooks
+
+Execute na ordem:
+
+```text
+notebooks/00_inspecao_inicial.ipynb
+notebooks/01_eda_e_qualidade_fontes.ipynb
+notebooks/02_inteligencia_priorizacao.ipynb
+notebooks/03_desenho_experimento.ipynb
+```
+
+Os artefatos intermediários são gravados em `data/processed/`.
+
+### 4. Rodar testes unitários
 
 ```bash
 python -m pytest tests/test_utils.py -v
 ```
 
----
+## Arquivos de apoio
 
-## Abordagem e Premissas
-
-### Parte 1: Análise Exploratória e Qualidade de Fontes
-
-**Desestruturação e correlação de sistemas com performance real**
-
-O campo `telefone_aparicoes` (array de dicionários) é explodido para associar cada telefone aos seus sistemas de origem (`id_sistema`). O join é **causal**: uma fonte só recebe crédito por um disparo se o telefone já existia naquela fonte **antes** do envio. Isso evita inflar o ranking de fontes que simplesmente apareceram depois do disparo.
-
-A deduplicação por `(telefone_numero, id_sistema)` remove múltiplas aparições do mesmo telefone no mesmo sistema, garantindo que cada fonte conte apenas uma vez por telefone.
-
-**Métrica primária:** Taxa de entrega (`delivered` + `read`) como métrica operacional. Taxa de leitura (`read`) como métrica secundária de negócio.
-
-**Ranking de fontes — Empirical Bayes Lower Bound**
-
-Em vez de usar taxa bruta (que favorece fontes com pouco volume), adotamos o limite inferior beta-binomial empírico (Empirical Bayes), que encolhe fontes com pouco volume para a média global. Wilson Score é calculado como diagnóstico complementar.
-
-**Ranking causal por atribuição full (resultado principal)**
-
-| Rank | id_sistema           | Disparos | Taxa Entrega | EB Lower | Score |
-|------|----------------------|----------|-------------|----------|-------|
-| 1    | -4704067261970591609 | 195.363  | 99.29%      | 99.25%   | 1.000 |
-| 2    | -2757366171786647144 | 6.796    | 96.53%      | 96.09%   | 0.307 |
-| 3    | 3094574413675758272  | 242.123  | 95.61%      | 95.53%   | 0.184 |
-| 4    | 4458959843028638627  | 19.694   | 95.26%      | 94.97%   | 0.062 |
-| 5    | -133612832286195827  | 20.434   | 95.17%      | 94.89%   | 0.045 |
-| 6    | 1257277410380486863  | 149.899  | 94.80%      | 94.69%   | 0.000 |
-
-O ranking se sustenta nas três análises de viés (correlação volume-taxa, first-touch e intra-CPF), embora a diferenciação prática entre os sistemas seja pequena (~94-99%).
-
-**Janela de atualidade — Decaimento temporal**
-
-| Faixa     | Taxa Entrega | Taxa Leitura | n        |
-|-----------|-------------|-------------|----------|
-| <30d      | 98.27%      | 76.18%      | 7.230    |
-| 30-90d    | 97.49%      | 75.37%      | 28.430   |
-| 90-180d   | 98.11%      | 76.63%      | 216.459  |
-| 180d-1a   | 94.68%      | 71.66%      | 96.348   |
-| 1-2a      | 94.14%      | 71.12%      | 86.415   |
-| >2a       | 93.33%      | 69.92%      | 74.397   |
-
-Existe decaimento a partir de ~180 dias, com queda de ~5pp em entrega de <180d para >2a. O half-life de 90 dias (escolhido via grid search temporal) equivale a um "prazo de validade" prático de ~3 meses.
-
-### Parte 2: Inteligência de Priorização
-
-**Ranking de sistemas** — O mesmo ranking da Parte 1, aprendido no período de treino (60%), serve de base para o score operacional.
-
-**Algoritmo de escolha** — Combina:
-1. **Score da origem** (Empirical Bayes do sistema) × **decaimento temporal** (exponencial com half-life=90d)
-2. **Score do DDD** (prior bayesiano suavizado por DDD)
-3. **Qualidade do telefone** (ALTA=1.0, MEDIA=0.5, BAIXA=0.25)
-4. **Exclusividade CPF-telefone** (1 / CPFs distintos por telefone)
-5. **Penalidade de proprietários** (1 / n proprietários)
-6. **Quantidade de sistemas** (log1p)
-7. **Proporção de aparições causais**
-
-O modelo logístico (AUC 0.66, test) e uma heurística com pesos arbitrários são comparados contra baselines determinísticos (telefone mais recente, fonte mais recente, alfabético) e um baseline aleatório.
-
-**Resultado: o modelo NÃO superou baselines determinísticos.**
-
-| Método                | Entrega Top1 | Read Top1 | Prob ≥1 Entrega |
-|-----------------------|-------------|-----------|-----------------|
-| fonte_mais_recente    | 88.66%      | 63.99%    | 84.23%          |
-| heuristica            | 84.89%      | 58.30%    | 84.16%          |
-| random (média 20)     | 83.07%      | 57.47%    | 84.12%          |
-| alfabetico            | 79.66%      | 52.73%    | 84.01%          |
-| mais_recente          | 77.30%      | 48.40%    | 83.99%          |
-| modelo_logistico      | 74.26%      | 44.47%    | 83.99%          |
-
-O champion escolhido foi **fonte_mais_recente** (telefone cuja fonte mais recente tem o maior score), com status de **candidato para validação A/B com evidência offline fraca**, pois:
-- A cobertura do holdout é <20%
-- As diferenças entre métodos são sub-percentuais
-- O modelo não superou métodos simples
-
-**Algoritmo operacional final:** Para cada CPF com 2+ telefones candidatos, selecionar os 2 telefones com maior `score_fonte_mais_recente`, desempatando por recência e score heurístico.
-
-### Parte 3: Desenho de Experimento (Teste A/B)
-
-**Hipóteses**
-- H0: A regra champion não aumenta a proporção de CPFs elegíveis com pelo menos uma entrega
-- H1: A regra champion aumenta essa proporção
-
-**População:** CPFs com 2+ telefones móveis candidatos (~30.695 na dimensão, ~10.411 com histórico de disparos)
-
-**Tamanho amostral (α=0.05, poder=0.80)**
-
-| Uplift mínimo | CPFs necessários | Duração estimada |
-|---------------|-------------------|------------------|
-| 0.5 p.p.      | 36.318            | ~2.588 dias (7+ anos) |
-| 1.0 p.p.      | 8.476             | ~604 dias (1.7 anos) |
-| 2.0 p.p.      | 1.792             | ~128 dias (4 meses) |
-| 3.0 p.p.      | 625               | ~45 dias (6 semanas) |
-
-**Recomendação:** Considerar métricas mais discriminativas (taxa de leitura, custo por mensagem lida) e ampliar a população elegível via integração de mais fontes.
-
----
-
-## Premissas
-
-1. **Status `processing` excluído** — status intermediário sem resultado final definitivo
-2. **Telefones fixos excluídos** — WhatsApp não entrega em linhas fixas (apenas 8 registros)
-3. **Entrega como métrica primária operacional** — `delivered` ou `read` indicam contato efetivo
-4. **Join causal** — uma fonte só recebe crédito se o telefone já existia naquela fonte antes do envio
-5. **Empirical Bayes para ranking** — shrinkage bayesiano penaliza fontes com pouco volume
-6. **Split temporal** — treino/tuning/teste por timestamp, não aleatório, para evitar vazamento
-7. **Randomização por CPF** — evita contaminação entre grupos no A/B test
-
----
-
-## Limitações e Pontos de Atenção
-
-1. **Modelo logístico não superou baselines simples** — AUC de 0.66 ficou abaixo do método "fonte_mais_recente". O champion é determinístico, não preditivo.
-2. **Cobertura do holdout baixa (~18%)** — A maioria dos CPFs no teste não tem dados per-telefone, tornando métricas offline proxies frágeis.
-3. **Diferenças marginais entre métodos** — Sub-percentuais em proxy metrics reforçam necessidade de validação A/B.
-4. **Baseline muito alto (96% entrega)** — Pouco espaço para ganho marginal em entrega; leitura ou custo podem ser mais discriminativos.
-5. **Volume elegível reduzido** — Apenas ~14 CPFs elegíveis/dia tornam A/B tests longos para efeitos pequenos.
-6. **Heurística com pesos arbitrários** — Não são calibrados estatisticamente; servem como baseline comparativo.
-7. **Campo `validacao_telefone`** disponível mas não utilizado como feature — potencial para investigação futura.
-8. **CPF mismatch entre tabelas** — Baixa interseção (1.331 CPFs) entre dimensão e dispatch limita validação por CPF.
-
----
-
-## Tecnologias
-
-- Python 3.12, pandas, numpy, pyarrow
-- matplotlib, seaborn (visualização)
-- scipy, statsmodels (estatística)
-- scikit-learn (Regressão Logística)
-- Jupyter Notebooks, pytest
-
----
-
-## Autor
-
-Matheus de Andrade Santos
+- `src/utils.py`: funções compartilhadas pelos notebooks, incluindo filtros, joins causais, métricas, ranking, priorização e avaliação offline.
+- `tests/test_utils.py`: testes unitários das principais funções utilitárias.
+- `RELATORIO.md`: relatório consolidado, com a explicação narrativa completa da solução.
+- `enunciado/README.md`: enunciado original do desafio.
