@@ -103,10 +103,10 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Em Linux/Mac:
+Em Linux:
 
 ```bash
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -129,7 +129,17 @@ whatsapp_dim_telefone_mascarado.parquet
 whatsapp_schema.yml
 ```
 
-### 3. Executar os notebooks
+### 3. Rodar testes unitários
+
+Antes de executar os notebooks, recomenda-se rodar os testes unitários para validar as funções compartilhadas em `src/utils.py`. Eles cobrem os principais contratos usados no fluxo analítico: constantes operacionais, filtros, join causal, métricas, ranking, features temporais e seleção top-2.
+
+```bash
+python -m pytest tests/test_utils.py -v
+```
+
+Com a suíte verde, a execução dos notebooks tende a ficar mais segura porque os blocos analíticos reutilizam esses utilitários.
+
+### 4. Executar os notebooks
 
 Execute na ordem:
 
@@ -141,12 +151,6 @@ notebooks/03_desenho_experimento.ipynb
 ```
 
 Os artefatos intermediários são gravados em `data/processed/`.
-
-### 4. Rodar testes unitários
-
-```bash
-python -m pytest tests/test_utils.py -v
-```
 
 ## Arquivos de apoio
 
